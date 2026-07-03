@@ -24,7 +24,6 @@ func must[T any](val T, err error) T {
 }
 
 func do(url, token string, body map[string]any) (map[string]any, error) {
-
 	var req *http.Request
 	var err error
 	effUrl := baseURL + url
@@ -67,7 +66,7 @@ func do(url, token string, body map[string]any) (map[string]any, error) {
 	}
 
 	if res.StatusCode != http.StatusOK {
-		fmt.Printf("%s: \033[31m%s\033[0m\n", url, res.Status)
+		fmt.Printf("%s: \033[31m%s %s\033[0m\n", url, res.Status, res.Body)
 		os.Exit(1)
 	}
 
@@ -99,32 +98,189 @@ func main() {
 		return
 	}
 
-	// check if char is existing
-	_ = must(do("characters/Holzfred", token, nil))
-
 	for {
-		// get health
-		character := must(do("characters/Holzfred", token, nil))
-		expiration := must(time.Parse(time.RFC3339, character["cooldown_expiration"].(string)))
+		//chickenPlan.Execute(characterName, token)
+		woodPlan.Execute("Christopf", token)
+	}
+}
+
+type Action interface {
+	Do(character, token string)
+}
+
+type URLAction struct {
+	URL  string
+	Data map[string]any
+}
+
+func (u URLAction) Do(character, token string) {
+	do(fmt.Sprintf(u.URL, character), token, u.Data)
+}
+
+type GenericAction struct {
+	fn func(character, token string)
+}
+
+func (g GenericAction) Do(character, token string) {
+	g.fn(character, token)
+}
+
+var (
+	RestAction          = URLAction{URL: "my/%s/action/rest"}
+	FightAction         = URLAction{URL: "my/%s/action/fight"}
+	GatherAction        = URLAction{URL: "my/%s/action/gathering"}
+	ShowInventoryAction = GenericAction{fn: func(character, token string) {
+		charInfo := must(do("characters/"+character, token, nil))
+		fmt.Println("inventory:")
+		for _, el := range charInfo["inventory"].([]any) {
+			items := el.(map[string]any)
+			if items["code"].(string) == "" {
+				continue
+			}
+
+			fmt.Printf("\t\033[33m%-4.0f\033[0m %s\n", items["quantity"].(float64), items["code"].(string))
+		}
+	}}
+)
+
+func MoveAction(x, y int) Action {
+	return URLAction{URL: "my/%s/action/move", Data: map[string]any{"x": x, "y": y}}
+}
+
+func MovePOIAction(p POI) Action {
+	return URLAction{URL: "my/%s/action/move", Data: map[string]any{"x": p.X, "y": p.Y}}
+}
+
+type Condition func(charInfo map[string]any) bool
+
+func PositionCondition(x, y int) Condition {
+	return func(charInfo map[string]any) bool {
+		return charInfo["x"].(float64) == float64(x) && charInfo["y"].(float64) == float64(y)
+	}
+}
+
+func POICondition(p POI) Condition {
+	return func(charInfo map[string]any) bool {
+		return charInfo["x"].(float64) == p.X && charInfo["y"].(float64) == p.Y
+	}
+}
+
+func NotCondition(c Condition) Condition {
+	return func(charInfo map[string]any) bool {
+		return !c(charInfo)
+	}
+}
+
+func FullInventoryCondition() Condition {
+	return func(charInfo map[string]any) bool {
+		var items float64
+		for _, slot := range charInfo["inventory"].([]any) {
+			items += slot.(map[string]any)["quantity"].(float64)
+		}
+
+		return items >= charInfo["inventory_max_items"].(float64)
+	}
+}
+
+func ReadyCondition() Condition {
+	return func(charInfo map[string]any) bool {
+		expiration := must(time.Parse(time.RFC3339, charInfo["cooldown_expiration"].(string)))
 		if time.Since(expiration).Seconds() < 0 {
-			fmt.Printf("downtime to \033[36m%s\033[0m\n", character["cooldown_expiration"].(string))
-			time.Sleep(time.Until(expiration))
-			continue
+			fmt.Printf("downtime to \033[36m%s\033[0m\n", charInfo["cooldown_expiration"].(string))
+			return false
 		}
+		return true
+	}
+}
 
-		// health < 10 then reset
-		if character["hp"].(float64) < 10 {
-			must(do("my/Holzfred/action/rest", token, nil))
-			continue
+func AlwaysCondition(_ map[string]any) bool { return true }
+
+type Alternative struct {
+	name      string
+	actions   []Action
+	condition Condition
+}
+
+type POI struct {
+	X, Y float64
+}
+
+var (
+	ChickenPOI = POI{X: 0, Y: 1}
+	WoodPOI    = POI{X: -1, Y: 0}
+)
+
+var (
+	chickenPlan = Plan{
+		name:          "farm chicken",
+		preConditions: []Condition{NotCondition(FullInventoryCondition())},
+		alternatives: []Alternative{
+			{
+				name: "rest if almost dead",
+				condition: func(charInfo map[string]any) bool {
+					return charInfo["hp"].(float64) < 5
+				},
+				actions: []Action{RestAction},
+			},
+			{
+				name:      "move to chicken place",
+				condition: NotCondition(POICondition(ChickenPOI)),
+				actions:   []Action{MovePOIAction(ChickenPOI)},
+			},
+			{
+				name:      "fight chicken",
+				condition: AlwaysCondition,
+				actions:   []Action{FightAction, ShowInventoryAction},
+			},
+		},
+	}
+
+	woodPlan = Plan{
+		name:          "cut wood",
+		preConditions: []Condition{ReadyCondition(), NotCondition(FullInventoryCondition())},
+		alternatives: []Alternative{
+			{
+				name:      "move to forest",
+				condition: NotCondition(POICondition(WoodPOI)),
+				actions:   []Action{MovePOIAction(WoodPOI)},
+			},
+			{
+				name:      "cut some wood",
+				condition: AlwaysCondition,
+				actions:   []Action{GatherAction, ShowInventoryAction},
+			},
+		},
+	}
+)
+
+type Plan struct {
+	name          string
+	preConditions []Condition
+	alternatives  []Alternative
+}
+
+func (p *Plan) Execute(character, token string) {
+	charInfo := must(do("characters/"+character, token, nil))
+	for _, cond := range p.preConditions {
+		if !cond(charInfo) {
+			fmt.Println("can't execute plan: precondition not met")
+			return
 		}
+	}
 
-		// position != chicken farm? then move
-		if character["x"].(float64) != 0 && character["y"].(float64) != -1 {
-			must(do("my/Holzfred/action/move", token, map[string]any{"x": 0, "y": -1}))
-			continue
+	// always check and enforce cooldown before trying any task
+	expiration := must(time.Parse(time.RFC3339, charInfo["cooldown_expiration"].(string)))
+	if time.Since(expiration).Seconds() < 0 {
+		fmt.Printf("downtime to \033[36m%s\033[0m\n", charInfo["cooldown_expiration"].(string))
+		time.Sleep(time.Until(expiration))
+	}
+
+	for _, alt := range p.alternatives {
+		if alt.condition(charInfo) {
+			for _, action := range alt.actions {
+				action.Do(character, token)
+			}
+			return
 		}
-
-		// otherwise fight
-		must(do("my/Holzfred/action/fight", token, nil))
 	}
 }
